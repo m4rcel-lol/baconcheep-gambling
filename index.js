@@ -498,167 +498,263 @@ async function handleJoin(interaction, gameId, message) {
 async function handleJoinMoney(interaction, game, message) {
     const balance = getBalance(interaction.user.id);
     const amount = game.creatorMoney;
-    
+
     if (balance < amount) {
         return interaction.editReply({ content: `❌ Need $${amount.toFixed(2)}! You have $${balance.toFixed(2)}.` });
     }
-    
-    removeBalance(interaction.user.id, amount);
-    
-    const participants = JSON.parse(game.participants || '[]');
-    participants.push({ userId: interaction.user.id, username: interaction.user.username, amount: amount });
-    db.prepare('UPDATE coinflips SET participants = ? WHERE id = ?').run(JSON.stringify(participants), game.id);
-    
-    await startMoneyCoinflip(game.id, message);
-    await interaction.editReply({ content: `✅ Joined with $${amount.toFixed(2)}!` });
+
+    // Use a transaction to prevent race conditions
+    const transaction = db.transaction(() => {
+        // Re-check game status within transaction
+        const currentGame = db.prepare('SELECT * FROM coinflips WHERE id = ? AND status = ?').get(game.id, 'waiting');
+        if (!currentGame) {
+            throw new Error('Game no longer available');
+        }
+
+        const participants = JSON.parse(currentGame.participants || '[]');
+
+        // Check if already joined
+        if (participants.some(p => p.userId === interaction.user.id)) {
+            throw new Error('Already joined');
+        }
+
+        // Check if game already has participants
+        if (participants.length > 0) {
+            throw new Error('Game is full');
+        }
+
+        // Remove balance
+        removeBalance(interaction.user.id, amount);
+
+        // Add participant
+        participants.push({ userId: interaction.user.id, username: interaction.user.username, amount: amount });
+        db.prepare('UPDATE coinflips SET participants = ? WHERE id = ?').run(JSON.stringify(participants), currentGame.id);
+    });
+
+    try {
+        transaction();
+        await startMoneyCoinflip(game.id, message);
+        await interaction.editReply({ content: `✅ Joined with $${amount.toFixed(2)}!` });
+    } catch (error) {
+        console.error('Join money error:', error);
+        if (error.message === 'Game no longer available' || error.message === 'Game is full') {
+            return interaction.editReply({ content: `❌ ${error.message}!` });
+        } else if (error.message === 'Already joined') {
+            return interaction.editReply({ content: '❌ Already joined this game!' });
+        }
+        return interaction.editReply({ content: '❌ An error occurred while joining!' });
+    }
 }
 
 async function handleJoinItems(interaction, game, message) {
     const inventory = getInventory(interaction.user.id);
     const creatorItems = JSON.parse(game.creatorItems);
-    
+
     if (inventory.length < creatorItems.length) {
         return interaction.editReply({ content: `❌ Need ${creatorItems.length} items!` });
     }
-    
+
     // Auto-select lowest matching items
     const selectedItems = [];
     const usedIds = new Set();
-    
+
     for (const creatorItem of creatorItems) {
         const minValue = Math.floor(creatorItem.value * 0.9);
         const maxValue = Math.ceil(creatorItem.value * 1.1);
-        
+
         const matches = inventory
             .filter(item => !usedIds.has(item.id) && item.itemValue >= minValue && item.itemValue <= maxValue)
             .sort((a, b) => a.itemValue - b.itemValue);
-        
+
         if (matches.length === 0) {
             return interaction.editReply({ content: `❌ Can't match ${creatorItem.name} ($${minValue}-$${maxValue})` });
         }
-        
+
         selectedItems.push(matches[0]);
         usedIds.add(matches[0].id);
     }
-    
-    removeItemsFromInventory(interaction.user.id, selectedItems.map(i => i.id));
-    
-    const participants = JSON.parse(game.participants || '[]');
-    participants.push({
-        userId: interaction.user.id,
-        username: interaction.user.username,
-        items: selectedItems.map(i => ({ name: i.itemName, value: i.itemValue })),
-        totalValue: selectedItems.reduce((sum, i) => sum + i.itemValue, 0)
+
+    // Use a transaction to prevent race conditions
+    const transaction = db.transaction(() => {
+        // Re-check game status within transaction
+        const currentGame = db.prepare('SELECT * FROM coinflips WHERE id = ? AND status = ?').get(game.id, 'waiting');
+        if (!currentGame) {
+            throw new Error('Game no longer available');
+        }
+
+        const participants = JSON.parse(currentGame.participants || '[]');
+
+        // Check if already joined
+        if (participants.some(p => p.userId === interaction.user.id)) {
+            throw new Error('Already joined');
+        }
+
+        // Check if game already has participants
+        if (participants.length > 0) {
+            throw new Error('Game is full');
+        }
+
+        // Remove items
+        removeItemsFromInventory(interaction.user.id, selectedItems.map(i => i.id));
+
+        // Add participant
+        participants.push({
+            userId: interaction.user.id,
+            username: interaction.user.username,
+            items: selectedItems.map(i => ({ name: i.itemName, value: i.itemValue })),
+            totalValue: selectedItems.reduce((sum, i) => sum + i.itemValue, 0)
+        });
+        db.prepare('UPDATE coinflips SET participants = ? WHERE id = ?').run(JSON.stringify(participants), currentGame.id);
     });
-    db.prepare('UPDATE coinflips SET participants = ? WHERE id = ?').run(JSON.stringify(participants), game.id);
-    
-    await startItemCoinflip(game.id, message);
-    await interaction.editReply({ content: `✅ Joined with ${selectedItems.length} items!` });
+
+    try {
+        transaction();
+        await startItemCoinflip(game.id, message);
+        await interaction.editReply({ content: `✅ Joined with ${selectedItems.length} items!` });
+    } catch (error) {
+        console.error('Join items error:', error);
+        if (error.message === 'Game no longer available' || error.message === 'Game is full') {
+            return interaction.editReply({ content: `❌ ${error.message}!` });
+        } else if (error.message === 'Already joined') {
+            return interaction.editReply({ content: '❌ Already joined this game!' });
+        }
+        return interaction.editReply({ content: '❌ An error occurred while joining!' });
+    }
 }
 
 async function startMoneyCoinflip(gameId, message) {
-    const game = db.prepare('SELECT * FROM coinflips WHERE id = ?').get(gameId);
-    if (!game || game.status !== 'waiting') return;
-    
-    const participants = JSON.parse(game.participants || '[]');
-    if (participants.length === 0) return;
-    
-    const joiner = participants[0];
-    const amount = game.creatorMoney;
-    const totalPool = amount * 2;
-    const taxAmount = totalPool * config.taxRate;
-    const winnings = totalPool - taxAmount;
-    
-    const winner = Math.random() < 0.5 ? 'creator' : 'joiner';
-    
-    if (winner === 'creator') {
-        addBalance(game.creatorId, winnings);
-        addTax('money', 'tax', taxAmount, game.creatorName, game.id);
-        updateStats(game.creatorId, 'win', winnings);
-        updateStats(joiner.userId, 'loss', amount);
-    } else {
-        addBalance(joiner.userId, winnings);
-        addTax('money', 'tax', taxAmount, joiner.username, game.id);
-        updateStats(joiner.userId, 'win', winnings);
-        updateStats(game.creatorId, 'loss', amount);
+    try {
+        if (!message) {
+            console.error('startMoneyCoinflip: message is null or undefined');
+            return;
+        }
+
+        const game = db.prepare('SELECT * FROM coinflips WHERE id = ?').get(gameId);
+        if (!game || game.status !== 'waiting') return;
+
+        const participants = JSON.parse(game.participants || '[]');
+        if (participants.length === 0) return;
+
+        const joiner = participants[0];
+        const amount = game.creatorMoney;
+        const totalPool = amount * 2;
+        const taxAmount = totalPool * config.taxRate;
+        const winnings = totalPool - taxAmount;
+
+        const winner = Math.random() < 0.5 ? 'creator' : 'joiner';
+
+        // Use transaction to ensure atomic updates
+        const transaction = db.transaction(() => {
+            if (winner === 'creator') {
+                addBalance(game.creatorId, winnings);
+                addTax('money', 'tax', taxAmount, game.creatorName, game.id);
+                updateStats(game.creatorId, 'win', winnings);
+                updateStats(joiner.userId, 'loss', amount);
+            } else {
+                addBalance(joiner.userId, winnings);
+                addTax('money', 'tax', taxAmount, joiner.username, game.id);
+                updateStats(joiner.userId, 'win', winnings);
+                updateStats(game.creatorId, 'loss', amount);
+            }
+
+            db.prepare('UPDATE coinflips SET status = ?, winnerId = ? WHERE id = ?')
+                .run('completed', winner === 'creator' ? game.creatorId : joiner.userId, game.id);
+        });
+
+        transaction();
+
+        const winnerName = winner === 'creator' ? game.creatorName : joiner.username;
+
+        await message.edit({
+            embeds: [new EmbedBuilder()
+                .setColor('#00ff00')
+                .setTitle('💰 Coinflip Completed!')
+                .setDescription(`**${winnerName}** wins!`)
+                .addFields(
+                    { name: '💰 Total', value: `$${totalPool.toFixed(2)}` },
+                    { name: '📊 Tax', value: `$${taxAmount.toFixed(2)}` },
+                    { name: '💵 Winnings', value: `$${winnings.toFixed(2)}` }
+                )
+                .setTimestamp()
+            ],
+            components: []
+        });
+
+        setTimeout(() => message.delete().catch(() => {}), 15000);
+    } catch (error) {
+        console.error('Error in startMoneyCoinflip:', error);
     }
-    
-    db.prepare('UPDATE coinflips SET status = ?, winnerId = ? WHERE id = ?').run('completed', winner === 'creator' ? game.creatorId : joiner.userId, game.id);
-    
-    const winnerName = winner === 'creator' ? game.creatorName : joiner.username;
-    
-    await message.edit({ 
-        embeds: [new EmbedBuilder()
-            .setColor('#00ff00')
-            .setTitle('💰 Coinflip Completed!')
-            .setDescription(`**${winnerName}** wins!`)
-            .addFields(
-                { name: '💰 Total', value: `$${totalPool.toFixed(2)}` },
-                { name: '📊 Tax', value: `$${taxAmount.toFixed(2)}` },
-                { name: '💵 Winnings', value: `$${winnings.toFixed(2)}` }
-            )
-            .setTimestamp()
-        ], 
-        components: [] 
-    });
-    
-    setTimeout(() => message.delete().catch(() => {}), 15000);
 }
 
 async function startItemCoinflip(gameId, message) {
-    const game = db.prepare('SELECT * FROM coinflips WHERE id = ?').get(gameId);
-    if (!game || game.status !== 'waiting') return;
-    
-    const creatorItems = JSON.parse(game.creatorItems);
-    const participants = JSON.parse(game.participants || '[]');
-    if (participants.length === 0) return;
-    
-    const joiner = participants[0];
-    const totalPool = game.creatorTotalValue + joiner.totalValue;
-    const taxAmount = totalPool * config.taxRate;
-    
-    const winner = Math.random() < 0.5 ? 'creator' : 'joiner';
-    const allItems = [...creatorItems, ...joiner.items];
-    
-    if (winner === 'creator') {
-        allItems.forEach(item => addItemToInventory(game.creatorId, item.name, item.value));
-        allItems.forEach(item => {
-            const itemTax = (item.value / totalPool) * taxAmount;
-            addTax('item', item.name, itemTax, game.creatorName, game.id);
+    try {
+        if (!message) {
+            console.error('startItemCoinflip: message is null or undefined');
+            return;
+        }
+
+        const game = db.prepare('SELECT * FROM coinflips WHERE id = ?').get(gameId);
+        if (!game || game.status !== 'waiting') return;
+
+        const creatorItems = JSON.parse(game.creatorItems);
+        const participants = JSON.parse(game.participants || '[]');
+        if (participants.length === 0) return;
+
+        const joiner = participants[0];
+        const totalPool = game.creatorTotalValue + joiner.totalValue;
+        const taxAmount = totalPool * config.taxRate;
+
+        const winner = Math.random() < 0.5 ? 'creator' : 'joiner';
+        const allItems = [...creatorItems, ...joiner.items];
+
+        // Use transaction to ensure atomic updates
+        const transaction = db.transaction(() => {
+            if (winner === 'creator') {
+                allItems.forEach(item => addItemToInventory(game.creatorId, item.name, item.value));
+                allItems.forEach(item => {
+                    const itemTax = (item.value / totalPool) * taxAmount;
+                    addTax('item', item.name, itemTax, game.creatorName, game.id);
+                });
+                updateStats(game.creatorId, 'win', totalPool - taxAmount);
+                updateStats(joiner.userId, 'loss', joiner.totalValue);
+            } else {
+                allItems.forEach(item => addItemToInventory(joiner.userId, item.name, item.value));
+                allItems.forEach(item => {
+                    const itemTax = (item.value / totalPool) * taxAmount;
+                    addTax('item', item.name, itemTax, joiner.username, game.id);
+                });
+                updateStats(joiner.userId, 'win', totalPool - taxAmount);
+                updateStats(game.creatorId, 'loss', game.creatorTotalValue);
+            }
+
+            db.prepare('UPDATE coinflips SET status = ?, winnerId = ? WHERE id = ?')
+                .run('completed', winner === 'creator' ? game.creatorId : joiner.userId, game.id);
         });
-        updateStats(game.creatorId, 'win', totalPool - taxAmount);
-        updateStats(joiner.userId, 'loss', joiner.totalValue);
-    } else {
-        allItems.forEach(item => addItemToInventory(joiner.userId, item.name, item.value));
-        allItems.forEach(item => {
-            const itemTax = (item.value / totalPool) * taxAmount;
-            addTax('item', item.name, itemTax, joiner.username, game.id);
+
+        transaction();
+
+        const winnerName = winner === 'creator' ? game.creatorName : joiner.username;
+        const itemsList = allItems.map(i => `**${i.name}** ($${i.value.toFixed(2)})`).join('\n');
+
+        await message.edit({
+            embeds: [new EmbedBuilder()
+                .setColor('#00ff00')
+                .setTitle('📦 Coinflip Completed!')
+                .setDescription(`**${winnerName}** wins!`)
+                .addFields(
+                    { name: '💰 Total', value: `$${totalPool.toFixed(2)}` },
+                    { name: '📊 Tax', value: `$${taxAmount.toFixed(2)}` },
+                    { name: '📦 Items', value: itemsList.slice(0, 1024) }
+                )
+                .setTimestamp()
+            ],
+            components: []
         });
-        updateStats(joiner.userId, 'win', totalPool - taxAmount);
-        updateStats(game.creatorId, 'loss', game.creatorTotalValue);
+
+        setTimeout(() => message.delete().catch(() => {}), 15000);
+    } catch (error) {
+        console.error('Error in startItemCoinflip:', error);
     }
-    
-    db.prepare('UPDATE coinflips SET status = ?, winnerId = ? WHERE id = ?').run('completed', winner === 'creator' ? game.creatorId : joiner.userId, game.id);
-    
-    const winnerName = winner === 'creator' ? game.creatorName : joiner.username;
-    const itemsList = allItems.map(i => `**${i.name}** ($${i.value.toFixed(2)})`).join('\n');
-    
-    await message.edit({ 
-        embeds: [new EmbedBuilder()
-            .setColor('#00ff00')
-            .setTitle('📦 Coinflip Completed!')
-            .setDescription(`**${winnerName}** wins!`)
-            .addFields(
-                { name: '💰 Total', value: `$${totalPool.toFixed(2)}` },
-                { name: '📊 Tax', value: `$${taxAmount.toFixed(2)}` },
-                { name: '📦 Items', value: itemsList.slice(0, 1024) }
-            )
-            .setTimestamp()
-        ], 
-        components: [] 
-    });
-    
-    setTimeout(() => message.delete().catch(() => {}), 15000);
 }
 
 // ==================== CLIENT EVENTS ====================
@@ -753,11 +849,11 @@ client.on('interactionCreate', async interaction => {
             
             else if (interaction.customId === 'money_amount') {
                 await interaction.deferUpdate();
-                
-                const amount = parseInt(interaction.values[0]);
+
+                const selectedValue = interaction.values[0];
                 const coinflipChannel = client.channels.cache.get(config.coinflipChannelId);
-                
-                if (amount === 'custom') {
+
+                if (selectedValue === 'custom') {
                     await interaction.editReply({ 
                         content: 'Type the amount you want to bet:', 
                         components: [] 
@@ -765,46 +861,74 @@ client.on('interactionCreate', async interaction => {
                     
                     const filter = m => m.author.id === interaction.user.id && !isNaN(m.content) && parseFloat(m.content) > 0;
                     const collector = interaction.channel.createMessageCollector({ filter, time: 30000, max: 1 });
-                    
+
                     collector.on('collect', async m => {
-                        const customAmount = parseFloat(m.content);
-                        const balance = getBalance(interaction.user.id);
-                        
-                        if (customAmount > balance) {
-                            return m.reply({ content: `❌ Only have $${balance.toFixed(2)}!`, ephemeral: true });
+                        try {
+                            const customAmount = parseFloat(m.content);
+
+                            if (isNaN(customAmount) || customAmount <= 0) {
+                                return m.reply({ content: '❌ Invalid amount! Please enter a positive number.', ephemeral: true });
+                            }
+
+                            const balance = getBalance(interaction.user.id);
+
+                            if (customAmount > balance) {
+                                return m.reply({ content: `❌ Insufficient funds! You have $${balance.toFixed(2)}.`, ephemeral: true });
+                            }
+
+                            removeBalance(interaction.user.id, customAmount);
+
+                            const result = db.prepare(`
+                                INSERT INTO coinflips (channelId, creatorId, creatorName, betType, creatorMoney, creatorTotalValue, status)
+                                VALUES (?, ?, ?, ?, ?, ?, 'waiting')
+                            `).run(coinflipChannel.id, interaction.user.id, interaction.user.username, 'money', customAmount, customAmount);
+
+                            const gameEmbed = new EmbedBuilder()
+                                .setColor('#ffd700')
+                                .setTitle('💰 New Money Coinflip')
+                                .setDescription(`${interaction.user.username} is looking for an opponent!`)
+                                .addFields(
+                                    { name: 'Amount', value: `$${customAmount.toFixed(2)}` },
+                                    { name: 'Tax', value: '10% on winnings' }
+                                )
+                                .setTimestamp();
+
+                            const row = new ActionRowBuilder().addComponents(
+                                new ButtonBuilder()
+                                    .setCustomId(`join_${result.lastInsertRowid}`)
+                                    .setLabel('💰 JOIN')
+                                    .setStyle(ButtonStyle.Success)
+                            );
+
+                            const msg = await coinflipChannel.send({ embeds: [gameEmbed], components: [row] });
+                            db.prepare('UPDATE coinflips SET messageId = ? WHERE id = ?').run(msg.id, result.lastInsertRowid);
+
+                            await m.reply({ content: '✅ Game created!', ephemeral: true });
+                            await interaction.editReply({ content: `✅ Coinflip created for $${customAmount.toFixed(2)}!`, components: [] }).catch(() => {});
+                        } catch (error) {
+                            console.error('Custom amount collection error:', error);
+                            await m.reply({ content: '❌ An error occurred while creating the game!', ephemeral: true }).catch(() => {});
                         }
-                        
-                        removeBalance(interaction.user.id, customAmount);
-                        
-                        const result = db.prepare(`
-                            INSERT INTO coinflips (channelId, creatorId, creatorName, betType, creatorMoney, creatorTotalValue, status)
-                            VALUES (?, ?, ?, ?, ?, ?, 'waiting')
-                        `).run(coinflipChannel.id, interaction.user.id, interaction.user.username, 'money', customAmount, customAmount);
-                        
-                        const gameEmbed = new EmbedBuilder()
-                            .setColor('#ffd700')
-                            .setTitle('💰 New Money Coinflip')
-                            .setDescription(`${interaction.user.username} is looking for an opponent!`)
-                            .addFields(
-                                { name: 'Amount', value: `$${customAmount.toFixed(2)}` },
-                                { name: 'Tax', value: '10% on winnings' }
-                            )
-                            .setTimestamp();
-                        
-                        const row = new ActionRowBuilder().addComponents(
-                            new ButtonBuilder()
-                                .setCustomId(`join_${result.lastInsertRowid}`)
-                                .setLabel('💰 JOIN')
-                                .setStyle(ButtonStyle.Success)
-                        );
-                        
-                        const msg = await coinflipChannel.send({ embeds: [gameEmbed], components: [row] });
-                        db.prepare('UPDATE coinflips SET messageId = ? WHERE id = ?').run(msg.id, result.lastInsertRowid);
-                        
-                        await m.reply({ content: '✅ Game created!', ephemeral: true });
                     });
-                    
+
+                    collector.on('end', (collected, reason) => {
+                        if (reason === 'time' && collected.size === 0) {
+                            interaction.editReply({ content: '❌ Timed out! Please try again.', components: [] }).catch(() => {});
+                        }
+                    });
+
                 } else {
+                    const amount = parseFloat(selectedValue);
+
+                    if (isNaN(amount) || amount <= 0) {
+                        return interaction.editReply({ content: '❌ Invalid amount!', components: [] });
+                    }
+
+                    const balance = getBalance(interaction.user.id);
+                    if (balance < amount) {
+                        return interaction.editReply({ content: `❌ Insufficient funds! You have $${balance.toFixed(2)}.`, components: [] });
+                    }
+
                     removeBalance(interaction.user.id, amount);
                     
                     const result = db.prepare(`

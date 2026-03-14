@@ -1,4 +1,15 @@
 {
+  "name": "baconcheep-gambling-bot",
+  "version": "1.0.0",
+  "description": "A Discord gambling bot with coinflip games",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": ["discord", "bot", "gambling", "coinflip"],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
     "better-sqlite3": "^12.8.0",
     "discord.js": "^14.14.1",
